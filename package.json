@@ -20,7 +20,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/geneon-ai/tailgram"
+    "url": "https://github.com/k16yamada/tailgram"
   },
   "engines": {
     "node": ">=24.2"
