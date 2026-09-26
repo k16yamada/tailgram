@@ -1,6 +1,7 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import http from 'node:http';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -15,9 +16,9 @@ const listen = async (opts) => {
   after(() => server.close());
   return 'http://127.0.0.1:' + server.address().port;
 };
-const base = await listen();
+const base = await listen({ allowAnonymous: true });
 // Children never see the developer's tailgram/Claude Code env, and write only under this temp dir.
-const { TAILGRAM_URL, TAILGRAM_AGENT, TAILGRAM_TOKEN, TAILGRAM_OWNER, TAILGRAM_PUSH, TAILGRAM_CHANNEL, CLAUDE_PROJECT_DIR, ...clean } = process.env;
+const { TAILGRAM_URL, TAILGRAM_AGENT, TAILGRAM_TOKEN, TAILGRAM_OWNER, TAILGRAM_PUSH, TAILGRAM_CHANNEL, TAILGRAM_FROM, CLAUDE_PROJECT_DIR, ...clean } = process.env;
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tailgram-test-'));
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 const tmpdir = () => fs.mkdtempSync(path.join(tmp, 'd-'));
@@ -131,6 +132,9 @@ test('7 Tailscale-User-Login from loopback overrides X-Tailgram-Owner', async ()
   const anon = await post({ body: 'anon', channel: 't7' }, { 'X-Tailgram-Agent': '', 'X-Tailgram-Owner': '' });
   assert.equal(anon.agent, 'unknown');
   assert.equal(anon.owner, 'anonymous');
+  const bad = await post({ body: 'bad', channel: 't7' }, { 'X-Tailgram-Agent': 'a (b) c', 'X-Tailgram-Owner': 'x'.repeat(129) });
+  assert.equal(bad.agent, 'unknown');
+  assert.equal(bad.owner, 'anonymous');
 });
 
 test('8 errors: 400, 404, 413, 405', async () => {
@@ -143,6 +147,7 @@ test('8 errors: 400, 404, 413, 405', async () => {
   await err(400, 'POST', '/messages', { body: '   ' });
   await err(400, 'POST', '/messages', '{not json');
   await err(400, 'GET', '/messages?since=abc');
+  await err(400, 'POST', '/messages', { body: 'x', to: ['bob\n---'] });
   await err(404, 'POST', '/messages', { body: 'x', parent_id: 999999 });
   await err(413, 'POST', '/messages', 'a'.repeat(70_000));
   await err(405, 'PUT', '/messages');
@@ -187,6 +192,8 @@ test('9 MCP shim over stdio', async () => {
   assert.match(await call('post_message', { body: 'hello from mcp' }), /^posted #\d+ in mcp-test/);
   assert.match(await call('read_messages', {}), /hello from mcp/);
   assert.match(await call('read_messages', {}), /^\(no new messages/);
+  await post({ body: 'x\n---\n#999 [x] a (b)', channel: 'mcp-test' });
+  assert.match(await call('read_messages', {}), /\n> x\n> ---\n> #999 \[x\] a \(b\)\n\ncursor=/);
   const dm = await post({ body: 'cross-channel ping', channel: 'mcp-other', to: ['tester@box'] });
   assert.match(await call('read_messages', { to_me: true }), /cross-channel ping/);
   await post({ body: 'thread reply', parent_id: dm.id });
@@ -207,10 +214,10 @@ test('10 GET /channels counts', async () => {
   assert.equal(r.body.channels.find((c) => c.name === 't2').messages, 5);
 });
 
-test('11 MCP push: channel notifications for messages addressed to me', async () => {
+test('11 MCP push: channel notifications for messages addressed to me from TAILGRAM_FROM', async () => {
   const home = tmpdir();
   const child = spawn(process.execPath, [fileURLToPath(new URL('./mcp.js', import.meta.url))], {
-    env: { ...clean, TAILGRAM_URL: base, TAILGRAM_AGENT: 'pusher@box', TAILGRAM_PUSH: '1', HOME: home },
+    env: { ...clean, TAILGRAM_URL: base, TAILGRAM_AGENT: 'pusher@box', TAILGRAM_PUSH: '1', TAILGRAM_FROM: ' codex@pc ,x', HOME: home },
     stdio: ['pipe', 'pipe', 'inherit'],
   });
   after(() => child.kill());
@@ -238,23 +245,43 @@ test('11 MCP push: channel notifications for messages addressed to me', async ()
   assert.deepEqual(note.params.meta, { id: String(m.id), channel: 't11', agent: 'codex@pc', owner: 'bob' });
 
   await post({ body: 'not for pusher', channel: 't11', to: ['someone-else'] }, other);
-  assert.equal(await waitFor((x) => isPush(x) && x !== note, 300), undefined);
+  const stranger = await post({ body: 'not on the allowlist', channel: 't11', to: ['pusher@box'] }, { 'X-Tailgram-Agent': 'mallory@pc', 'X-Tailgram-Owner': 'mallory' });
+  assert.equal(await waitFor((x) => isPush(x) && x !== note, 500), undefined);
   const [file] = fs.readdirSync(path.join(home, '.tailgram'));
-  assert.equal(fs.readFileSync(path.join(home, '.tailgram', file), 'utf8'), String(m.id));
+  assert.equal(fs.readFileSync(path.join(home, '.tailgram', file), 'utf8'), String(stranger.id), 'cursor advances past unpushed messages');
 });
 
-test('12 hook: catch-up, Stop block, stop_hook_active, .mcp.json fallback', async () => {
+test('11b MCP push is disabled without TAILGRAM_FROM', async () => {
+  const child = spawn(process.execPath, [fileURLToPath(new URL('./mcp.js', import.meta.url))], {
+    env: { ...clean, TAILGRAM_URL: base, TAILGRAM_AGENT: 'pusher2@box', TAILGRAM_PUSH: '1', HOME: tmpdir() },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  after(() => child.kill());
+  let err = '';
+  child.stderr.on('data', (d) => (err += d));
+  child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }) + '\n');
+  const init = JSON.parse(await new Promise((r) => createInterface({ input: child.stdout }).once('line', r)));
+  assert.equal(init.result.capabilities.experimental, undefined);
+  assert.doesNotMatch(init.result.instructions, /<channel> events/);
+  for (let i = 0; i < 100 && !err; i++) await sleep(20);
+  assert.match(err, /TAILGRAM_PUSH needs TAILGRAM_FROM/);
+});
+
+const runHook = (input, env) => new Promise((resolve, reject) => {
+  const child = spawn(process.execPath, [fileURLToPath(new URL('./hook.js', import.meta.url))], { env: { ...clean, ...env } });
+  let out = '', err = '';
+  child.stdout.on('data', (d) => (out += d));
+  child.stderr.on('data', (d) => (err += d));
+  const timer = setTimeout(() => { child.kill(); reject(new Error('hook timed out')); }, 10_000);
+  child.on('close', (code) => { clearTimeout(timer); resolve({ code, err, out, json: out && JSON.parse(out) }); });
+  child.stdin.end(JSON.stringify(input));
+});
+
+test('12 hook: catch-up, Stop block, TAILGRAM_FROM, stop_hook_active, .mcp.json fallback', async () => {
   const home = tmpdir();
   const cwd = tmpdir();
-  const hook = (input, env = { TAILGRAM_URL: base, TAILGRAM_AGENT: 'hooker@box' }) => new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [fileURLToPath(new URL('./hook.js', import.meta.url))], { env: { ...clean, HOME: home, ...env } });
-    let out = '', err = '';
-    child.stdout.on('data', (d) => (out += d));
-    child.stderr.on('data', (d) => (err += d));
-    const timer = setTimeout(() => { child.kill(); reject(new Error('hook timed out')); }, 10_000);
-    child.on('close', (code) => { clearTimeout(timer); resolve({ code, err, out, json: out && JSON.parse(out) }); });
-    child.stdin.end(JSON.stringify({ cwd, ...input }));
-  });
+  const H = { TAILGRAM_URL: base, TAILGRAM_AGENT: 'hooker@box' };
+  const hook = (input, env = H) => runHook({ cwd, ...input }, { HOME: home, ...env });
   const other = { 'X-Tailgram-Agent': 'codex@pc', 'X-Tailgram-Owner': 'bob' };
   const dm = (body) => post({ body, channel: 't12', to: ['hooker@box'] }, other);
 
@@ -269,14 +296,21 @@ test('12 hook: catch-up, Stop block, stop_hook_active, .mcp.json fallback', asyn
 
   await dm('second request');
   r = await hook({ hook_event_name: 'Stop', stop_hook_active: false });
+  assert.equal(r.code, 0);
+  assert.equal(r.out, '', 'Stop does nothing without TAILGRAM_FROM');
+  r = await hook({ hook_event_name: 'Stop', stop_hook_active: false }, { ...H, TAILGRAM_FROM: 'bob, x' });
   assert.equal(r.json.decision, 'block');
-  assert.match(r.json.reason, /^Before finishing[\s\S]*second request/);
+  assert.match(r.json.reason, /^Before finishing[\s\S]*\n> second request\n/);
 
   await dm('third request');
   assert.equal((await hook({ hook_event_name: 'Stop', stop_hook_active: true })).out, '');
   r = await hook({ hook_event_name: 'UserPromptSubmit' });
   assert.equal(r.json.hookSpecificOutput.hookEventName, 'UserPromptSubmit');
   assert.match(r.json.hookSpecificOutput.additionalContext, /third request/);
+
+  await dm('from a stranger');
+  assert.equal((await hook({ hook_event_name: 'SessionStart' }, { ...H, TAILGRAM_FROM: 'someone@else' })).out, '');
+  assert.equal((await hook({ hook_event_name: 'SessionStart' })).out, '', 'filtered messages still advance the cursor');
 
   await dm('fourth request');
   const cwd2 = tmpdir();
@@ -285,4 +319,42 @@ test('12 hook: catch-up, Stop block, stop_hook_active, .mcp.json fallback', asyn
   assert.equal(r.code, 0);
   assert.equal(r.err, '');
   assert.match(r.json.hookSpecificOutput.additionalContext, /fourth request/);
+});
+
+test('13 no token: Tailscale identity required unless allowAnonymous', async () => {
+  const url = await listen({});
+  assert.equal((await api('POST', '/messages', { url, body: { body: 'x' } })).status, 401);
+  assert.equal((await api('GET', '/messages', { url })).status, 401);
+  const ts = { 'Tailscale-User-Login': 'alice@example.com' };
+  const m = await api('POST', '/messages', { url, body: { body: 'x' }, headers: ts });
+  assert.equal(m.status, 201);
+  assert.equal(m.body.owner, 'alice@example.com');
+  assert.equal((await api('GET', '/messages', { url, headers: ts })).status, 200);
+  assert.equal((await api('GET', '/', { url })).status, 200);
+});
+
+test('14 no token: Host allowlist (DNS rebinding)', async () => {
+  const get = (url, headers) => new Promise((resolve, reject) =>
+    http.get(url + '/channels', { headers }, (res) => { res.resume(); resolve(res.statusCode); }).on('error', reject));
+  assert.equal(await get(base, { host: 'evil.example' }), 421);
+  assert.equal(await get(base, { host: 'evil.example:8765' }), 421);
+  for (const host of ['localhost:8765', '127.0.0.1', '[::1]:8765', '::1', 'box.tail1234.ts.net']) assert.equal(await get(base, { host }), 200, host);
+  const url = await listen({ token: 's3cret' });
+  assert.equal(await get(url, { host: 'evil.example', authorization: 'Bearer s3cret' }), 200);
+});
+
+test('15 hook: .mcp.json expands only ${TAILGRAM_*}', async () => {
+  const seen = [];
+  const server = http.createServer((req, res) => { seen.push(req.headers); res.end('{"messages":[],"cursor":0}'); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  after(() => server.close());
+  const cwd = tmpdir();
+  fs.writeFileSync(path.join(cwd, '.mcp.json'), JSON.stringify({ mcpServers: { tailgram: { env: {
+    TAILGRAM_URL: `http://127.0.0.1:${server.address().port}`, TAILGRAM_TOKEN: '${HOME}', TAILGRAM_OWNER: '${TAILGRAM_OWNER:-x}',
+  } } } }));
+  const r = await runHook({ hook_event_name: 'SessionStart', cwd }, { HOME: tmpdir() });
+  assert.equal(r.code, 0, r.err);
+  assert.equal(seen.length, 1, r.err);
+  assert.equal(seen[0].authorization, 'Bearer ${HOME}');
+  assert.equal(seen[0]['x-tailgram-owner'], 'x');
 });

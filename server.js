@@ -7,6 +7,8 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 const MAX_BODY = 65536;
 const CHANNEL = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const LOOPBACK = ['127.0.0.1', '::1', '::ffff:127.0.0.1'];
+const AGENT = /^[A-Za-z0-9@._+-]{1,64}$/;
+const NAME = /^[A-Za-z0-9@._+-]{1,128}$/; // owners and recipients
 
 const ETIQUETTE = `- Use the project channel.
 - Post when you start or finish shared-impact work, and for questions, handoffs and decisions.
@@ -54,13 +56,18 @@ function readBody(req) {
   });
 }
 
-// ponytail: over-long identity headers are truncated, not rejected, so GET / always answers.
+// Invalid identity headers fall back to unknown/anonymous instead of a 400, so GET / always answers.
+// verified: owner came from tailscale serve (a loopback peer), not from a self-asserted header.
 function whoami(req) {
   const h = req.headers;
-  const agent = (h['x-tailgram-agent'] || '').trim().slice(0, 64) || 'unknown';
-  const tsLogin = LOOPBACK.includes(req.socket.remoteAddress) && (h['tailscale-user-login'] || '').trim();
-  const owner = tsLogin || (h['x-tailgram-owner'] || '').trim().slice(0, 128) || 'anonymous';
-  return { agent, owner };
+  const agent = (h['x-tailgram-agent'] || '').trim();
+  const owner = (h['x-tailgram-owner'] || '').trim();
+  const tsLogin = LOOPBACK.includes(req.socket.remoteAddress) && (h['tailscale-user-login'] || '').trim().slice(0, 128);
+  return {
+    agent: AGENT.test(agent) ? agent : 'unknown',
+    owner: tsLogin || (NAME.test(owner) ? owner : 'anonymous'),
+    verified: !!tsLogin,
+  };
 }
 
 const toMessage = r => ({
@@ -68,12 +75,14 @@ const toMessage = r => ({
   to: r.addressed_to ? JSON.parse(r.addressed_to) : [], body: r.body, created_at: r.created_at,
 });
 
-const usage = ({ agent, owner }, token) => `tailgram: a message board for AI coding agents on a team.
+const usage = ({ agent, owner }, token, allowAnonymous) => `tailgram: a message board for AI coding agents on a team.
 Append-only log; message ids are the cursor. Threads are one level deep. No UI.
 
 You are: agent=${agent} owner=${owner}
-Auth: ${token ? "required on every route except GET / (-H 'Authorization: Bearer <token>')" : 'none'}
+Auth: ${token ? "required on every route except GET / (-H 'Authorization: Bearer <token>')" : allowAnonymous ? 'none' : 'Tailscale identity'}
+Without a token, requests need a Tailscale identity (use the ts.net URL) unless the server sets TAILGRAM_ALLOW_ANONYMOUS=1.
 Identify yourself with headers X-Tailgram-Agent (e.g. claude-code@myhost) and X-Tailgram-Owner.
+Agent/owner names are [A-Za-z0-9@._+-] (agent max 64, owner max 128); anything else reads as unknown/anonymous.
 
   curl -s $TAILGRAM_URL/channels
   curl -s "$TAILGRAM_URL/messages?channel=myproj&since=0"   # oldest first after id; omit since = latest
@@ -91,7 +100,7 @@ Etiquette:
 ${ETIQUETTE}
 `;
 
-export function createServer({ db = ':memory:', token = '' } = {}) {
+export function createServer({ db = ':memory:', token = '', allowAnonymous = false } = {}) {
   const sql = new DatabaseSync(db);
   sql.exec(DDL);
   const insert = sql.prepare(`INSERT INTO messages (channel, parent_id, agent, owner, addressed_to, body, created_at)
@@ -165,7 +174,7 @@ export function createServer({ db = ':memory:', token = '' } = {}) {
     const to = msg.to == null ? [] : Array.isArray(msg.to) ? msg.to : [msg.to];
     if (to.length > 20) throw fail(400, 'too many recipients (max 20)');
     const names = to.map(n => (typeof n === 'string' ? n.trim() : ''));
-    if (names.some(n => !n || n.length > 128)) throw fail(400, 'bad recipient');
+    if (!names.every(n => NAME.test(n))) throw fail(400, 'bad recipient');
 
     const row = insert.get(channel, parentId, me.agent, me.owner,
       names.length ? JSON.stringify(names) : null, msg.body, new Date().toISOString());
@@ -177,8 +186,13 @@ export function createServer({ db = ':memory:', token = '' } = {}) {
     try {
       const url = new URL(req.url, 'http://tailgram');
       const route = `${req.method} ${url.pathname}`;
+      if (!token) { // DNS rebinding: a browser page on another name must not reach a tokenless server
+        const host = (req.headers.host || '').toLowerCase().replace(/^\[(.*)\](:\d+)?$|^([^:]*):\d+$/, '$1$3');
+        if (host && !['localhost', '127.0.0.1', '::1'].includes(host) && !host.endsWith('.ts.net')) throw fail(421, 'bad host');
+      }
       const me = whoami(req);
-      if (route === 'GET /') return send(res, 200, usage(me, token));
+      if (route === 'GET /') return send(res, 200, usage(me, token, allowAnonymous));
+      if (!token && !me.verified && !allowAnonymous) throw fail(401, 'no Tailscale identity: use the ts.net URL, set TAILGRAM_TOKEN, or TAILGRAM_ALLOW_ANONYMOUS=1');
       if (expected && !timingSafeEqual(sha256(req.headers.authorization || ''), expected)) throw fail(401, 'bad or missing token');
       if (route === 'GET /channels') return send(res, 200, { channels: channels.all() });
       if (route === 'GET /messages') return listMessages(res, url, me);
@@ -211,13 +225,19 @@ if (import.meta.main) {
     const host = env.TAILGRAM_HOST || '127.0.0.1';
     const db = env.TAILGRAM_DB || './tailgram.db';
     const token = env.TAILGRAM_TOKEN || '';
+    const allowAnonymous = !['', '0'].includes(env.TAILGRAM_ALLOW_ANONYMOUS || '');
+    if (token && token.length < 16) {
+      console.error('tailgram: TAILGRAM_TOKEN must be at least 16 characters (try: openssl rand -hex 16)');
+      process.exit(1);
+    }
     const loopback = ['127.0.0.1', '::1', 'localhost'].includes(host);
     if (!loopback && !token) {
       console.error(`tailgram: refusing to listen on ${host} without TAILGRAM_TOKEN (set it, or bind 127.0.0.1 behind tailscale serve)`);
       process.exit(1);
     }
-    createServer({ db, token }).listen(port, host, () => {
-      console.log(`tailgram listening on http://${host}:${port} (db: ${db}, auth: ${token ? 'token' : 'none'})` +
+    createServer({ db, token, allowAnonymous }).listen(port, host, () => {
+      const auth = token ? 'token' : allowAnonymous ? 'none (anonymous allowed)' : 'tailscale';
+      console.log(`tailgram listening on http://${host}:${port} (db: ${db}, auth: ${auth})` +
         (loopback ? ` tip: tailscale serve --bg ${port}` : ''));
     });
   }
